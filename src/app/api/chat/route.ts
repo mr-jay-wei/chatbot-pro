@@ -1,33 +1,30 @@
 import { NextResponse } from "next/server";
 import OpenAI from "openai";
-import { supabaseAdmin } from "@/lib/supabaseServer"; // 导入我们的服务器端 client
+import { supabaseAdmin } from "@/lib/supabaseServer";
 
 export const runtime = "edge";
 
 export async function POST(request: Request) {
-  let currentChatId = ''; // 用于在函数内部传递 chatId
-  let fullAssistantResponse = ''; // 用于累积完整的 AI 回复
-
   try {
     const body = await request.json();
     const clientMessage: string = body.message;
-    const chatId: string | null = body.chatId; // 从前端接收 chatId
+    // 如果前端传来 chatId，就用它；否则为 null
+    let currentChatId: string | null = body.chatId || null;
 
     if (!clientMessage) {
       return NextResponse.json({ error: "Message is required" }, { status: 400 });
     }
 
     // 步骤 1: 保存用户消息，并确保我们有一个 chatId
-    if (chatId) {
-      currentChatId = chatId;
+    // 这部分逻辑和之前一样，但我们把 currentChatId 的赋值放在了外面
+    if (currentChatId) {
       await supabaseAdmin.from('messages').insert({
         chat_id: currentChatId,
         role: 'user',
         content: clientMessage,
       });
     } else {
-      // 如果没有 chatId，说明是新对话
-      // 1. 创建一个新的 chat
+      // 如果是新对话，先创建 chat，再保存 message
       const { data: chatData, error: chatError } = await supabaseAdmin
         .from('chats')
         .insert({})
@@ -37,7 +34,6 @@ export async function POST(request: Request) {
       if (chatError) throw chatError;
       currentChatId = chatData.id;
 
-      // 2. 保存用户的第一条消息
       await supabaseAdmin.from('messages').insert({
         chat_id: currentChatId,
         role: 'user',
@@ -60,26 +56,41 @@ export async function POST(request: Request) {
       stream: true,
     });
 
-    // 步骤 3: 创建流式响应
+    // 步骤 3: 创建流式响应，并在流结束后保存 AI 回复
     const encoder = new TextEncoder();
     const stream = new ReadableStream({
       async start(controller) {
+        let fullAssistantResponse = ''; // 在流的内部累积回复
+
         for await (const chunk of completion) {
           const content = chunk.choices[0]?.delta?.content || "";
           if (content) {
-            fullAssistantResponse += content; // 累积 AI 回复
-            controller.enqueue(encoder.encode(content));
+            fullAssistantResponse += content; // 累积
+            controller.enqueue(encoder.encode(content)); // 发送给前端
           }
         }
-        controller.close();
-      },
-      async cancel() {
-        console.log("Stream cancelled by client.");
+
+        // --- 核心修正点 ---
+        // 当上面的循环结束后，意味着 AI 的回复已经完整
+        // 这就是保存 AI 回复到数据库的正确时机！
+        if (fullAssistantResponse && currentChatId) {
+          try {
+            await supabaseAdmin.from('messages').insert({
+              chat_id: currentChatId,
+              role: 'assistant',
+              content: fullAssistantResponse,
+            });
+            console.log("成功保存助手回复到数据库。");
+          } catch (dbError) {
+            console.error("保存助手回复到数据库时出错：", dbError);
+          }
+        }
+        
+        controller.close(); // 关闭流
       },
     });
 
-    // 步骤 4: 返回流式响应，并在 Header 中附带新的 chatId
-    // 这样前端就能知道这次对话的 ID 了
+    // 步骤 4: 返回流式响应
     return new Response(stream, {
       headers: {
         "Content-Type": "text/plain; charset=utf-8",
@@ -93,15 +104,5 @@ export async function POST(request: Request) {
       { error: error.message || "服务器内部错误" },
       { status: 500 }
     );
-  } finally {
-    // 步骤 5: 在所有操作结束后，无论成功与否，如果收到了完整的 AI 回复，就保存它
-    if (fullAssistantResponse && currentChatId) {
-      await supabaseAdmin.from('messages').insert({
-        chat_id: currentChatId,
-        role: 'assistant',
-        content: fullAssistantResponse,
-      });
-      console.log("成功保存助手回复到数据库。");
-    }
   }
 }
