@@ -117,10 +117,15 @@ export async function POST(request: Request) {
       },
     });
 
-  } catch (error: any) {
+  } catch (error: unknown) { // <--- 修正 1: any -> unknown
     console.error("API 路由 (带认证) 出错：", error);
+    // 修正 2: 添加类型守卫，确保安全
+    let errorMessage = "服务器内部错误";
+    if (error instanceof Error) {
+      errorMessage = error.message;
+    }
     return NextResponse.json(
-      { error: error.message || "服务器内部错误" },
+      { error: errorMessage },
       { status: 500 }
     );
   }

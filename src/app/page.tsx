@@ -61,8 +61,13 @@ export default function Home() {
           return newHistory;
         });
       }
-    } catch (err: any) {
-      const errorMessage = "发生错误：" + err.message;
+    } catch (err: unknown) { // <--- 修正 1: any -> unknown
+      // 修正 2: 添加类型守卫，并提供默认错误信息
+      let message = "未知错误";
+      if (err instanceof Error) {
+        message = err.message;
+      }
+      const errorMessage = "发生错误：" + message;
       setChatHistory(prev => {
         const newHistory = [...prev];
         const lastMessage = { ...newHistory[newHistory.length - 1] };
