@@ -16,7 +16,7 @@ IGNORE_PATTERNS: Set[str] = {
     ".env", "build", "dist", "*.pyc", "*.egg-info", "*.log",
     # UV 和数据相关文件/文件夹
     "dist_electron",".next",".env.local",
-    "dist_electron/*",
+    "dist_electron/*","tsconfig.tsbuildinfo",
     "uv.lock", "data", "my_chromadb_vector_store", "*/.pytest_cache", 
     # 特定路径忽略
     "*/package-lock.json","package-lock.json","out/*",

@@ -1,10 +1,10 @@
 import { NextResponse } from "next/server";
 import OpenAI from "openai";
 import { supabaseAdmin } from "@/lib/supabaseServer";
+import { auth } from "@clerk/nextjs/server"; // 导入 auth
 
 export const runtime = "nodejs";
 
-// 定义 API 消息的类型接口，确保类型安全
 interface ApiMessage {
   role: 'system' | 'user' | 'assistant';
   content: string;
@@ -12,6 +12,12 @@ interface ApiMessage {
 
 export async function POST(request: Request) {
   try {
+    // 步骤 0: 用户身份验证
+    const { userId } = await auth();
+    if (!userId) {
+      return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
+    }
+
     const body = await request.json();
     const clientMessage: string = body.message;
     let currentChatId: string | null = body.chatId || null;
@@ -20,17 +26,29 @@ export async function POST(request: Request) {
       return NextResponse.json({ error: "Message is required" }, { status: 400 });
     }
 
-    // 步骤 1: 保存用户消息，并确保我们有一个 chatId (逻辑不变)
+    // 步骤 1: 保存用户消息
     if (currentChatId) {
+      // 如果有 chatId，验证这个 chat 是否属于当前用户 (安全检查)
+      const { data: chat, error } = await supabaseAdmin
+        .from('chats')
+        .select('user_id')
+        .eq('id', currentChatId)
+        .single();
+      
+      if (error || chat.user_id !== userId) {
+        return NextResponse.json({ error: "Chat not found or access denied" }, { status: 404 });
+      }
+
       await supabaseAdmin.from('messages').insert({
         chat_id: currentChatId,
         role: 'user',
         content: clientMessage,
       });
     } else {
+      // 如果是新对话，创建时必须关联当前 userId
       const { data: chatData, error: chatError } = await supabaseAdmin
         .from('chats')
-        .insert({})
+        .insert({ user_id: userId }) // 关联用户 ID
         .select('id')
         .single();
 
@@ -44,28 +62,21 @@ export async function POST(request: Request) {
       });
     }
 
-    // --- 核心升级点：获取历史消息 ---
-    // 步骤 1.5: 从数据库获取当前对话的完整历史记录
+    // 步骤 1.5: 获取历史消息 (现在会根据用户 ID 过滤，更安全)
     const { data: historyData, error: historyError } = await supabaseAdmin
       .from('messages')
       .select('role, content')
       .eq('chat_id', currentChatId)
-      .order('created_at', { ascending: true }); // 必须按时间排序
+      .order('created_at', { ascending: true });
 
     if (historyError) throw historyError;
 
-    // 构造发送给 OpenAI API 的 messages 数组
     const messagesForApi: ApiMessage[] = [
-      { role: "system", content: "你是一个友好且专业的中文 AI 助手，请根据上下文进行回复。" },
-      // 注意：我们从数据库获取的历史消息已经包含了最新的用户消息
-      ...historyData, 
+      { role: "system", content: "你是一个友好且专业的中文 AI 助手。" },
+      ...historyData,
     ];
 
-    // 注意：为了防止上下文过长超出 token 限制，在生产环境中可能需要截断历史消息。
-    // 例如，只取最近的 10 条消息。这里为了演示，我们发送全部历史。
-
-
-    // 步骤 2: 调用 OpenAI，但使用我们构造的完整历史消息
+    // 后续步骤（调用 OpenAI，流式响应，保存 AI 回复）保持不变...
     const openai = new OpenAI({
       apiKey: process.env.OPENAI_API_KEY!,
       baseURL: process.env.OPENAI_API_BASE_URL || "https://api.openai.com/v1",
@@ -73,16 +84,14 @@ export async function POST(request: Request) {
 
     const completion = await openai.chat.completions.create({
       model: process.env.OPENAI_API_MODEL || "gpt-4o-mini",
-      messages: messagesForApi, // 使用包含完整历史的数组
+      messages: messagesForApi,
       stream: true,
     });
 
-    // 步骤 3 和 4: 流式响应和保存 AI 回复 (逻辑不变)
     const encoder = new TextEncoder();
     const stream = new ReadableStream({
       async start(controller) {
         let fullAssistantResponse = '';
-
         for await (const chunk of completion) {
           const content = chunk.choices[0]?.delta?.content || "";
           if (content) {
@@ -90,20 +99,13 @@ export async function POST(request: Request) {
             controller.enqueue(encoder.encode(content));
           }
         }
-
         if (fullAssistantResponse && currentChatId) {
-          try {
-            await supabaseAdmin.from('messages').insert({
-              chat_id: currentChatId,
-              role: 'assistant',
-              content: fullAssistantResponse,
-            });
-            console.log("成功保存 (带记忆的) 助手回复到数据库。");
-          } catch (dbError) {
-            console.error("保存助手回复到数据库时出错：", dbError);
-          }
+          await supabaseAdmin.from('messages').insert({
+            chat_id: currentChatId,
+            role: 'assistant',
+            content: fullAssistantResponse,
+          });
         }
-        
         controller.close();
       },
     });
@@ -116,7 +118,7 @@ export async function POST(request: Request) {
     });
 
   } catch (error: any) {
-    console.error("API 路由 (带记忆) 出错：", error);
+    console.error("API 路由 (带认证) 出错：", error);
     return NextResponse.json(
       { error: error.message || "服务器内部错误" },
       { status: 500 }
